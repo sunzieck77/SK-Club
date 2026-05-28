@@ -84,6 +84,19 @@
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
 
+        // ==========================================
+        // HELPER FUNCTIONS สำหรับประหยัด Quota ฝั่ง Admin
+        // ==========================================
+        function getClubMemberCount(students, clubId) {
+            if (!students || !clubId) return 0;
+            return students.filter(s => s.clubId === clubId).length;
+        }
+
+        function isClubFull(students, club) {
+            if (!students || !club) return false;
+            return getClubMemberCount(students, club.dbKey) >= club.capacity;
+        }
+
         const formatDate = (isoString) => {
             if (!isoString) return 'ไม่ได้ระบุเวลา';
             const date = new Date(isoString);
@@ -209,7 +222,7 @@
                                     <School className="text-white w-7 h-7 sm:w-8 sm:h-8" />
                                 </div>
                                 <h1 className="text-xl sm:text-2xl font-bold text-gray-800">SK CLUB</h1>
-                                <p className="text-gray-500 mt-1 sm:mt-2 text-xs sm:text-sm font-medium font-prompt">กรุณาป้อนรหัสนักเรียนเข้าสู่ระบบ</p>
+                                <p className="text-gray-500 mt-1 sm:mt-2 text-xs sm:text-sm font-medium">กรุณาป้อนรหัสนักเรียนเข้าสู่ระบบ</p>
                             </div>
 
                             <form onSubmit={handleLogin} className="space-y-4 sm:space-y-5">
@@ -365,7 +378,7 @@
                 setIsConfirmOpen(true);
             };
 
-            // 🌟 3. ปรับปรุงฟังก์ชัน confirmJoin ให้ปลอดภัย 100% ด้วยสถาปัตยกรรม Atomic Transaction
+            // 🌟 3. ปรับปรุงฟังก์ชัน confirmJoin ให้ปลอดภัย 100% ด้วยสถาปัตยกรรม Atomic Transaction (ห้ามแก้ไขส่วนนี้)
             const confirmJoin = async () => {
                 if (isSubmitting) return;
                 setIsSubmitting(true);
@@ -437,7 +450,6 @@
                         confirmButtonColor: '#3b82f6',
                         customClass: { popup: 'rounded-2xl' }
                     }).then(() => {
-                        // 🌟 เมื่อเกิด Error ให้ดึงข้อมูลชุมนุมรอบใหม่ทันที เพื่อเปลี่ยนสถานะปุ่มในหน้าจออัตโนมัติ
                         fetchClubsAndClassesOnce();
                     });
                 } finally {
@@ -581,7 +593,6 @@
 
                         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 mt-2">
                             {availableClubs.map(club => {
-                                // 🌟 4. ปรับให้อ่านค่าจำนวนสมาชิกจาก club.enrolledCount ตรง ๆ ตามโครงสร้าง Club-Centric
                                 const enrolled = club.enrolledCount || 0;
                                 const isFull = enrolled >= club.capacity;
 
@@ -593,7 +604,7 @@
                                         isFull={isFull}
                                         userHasClub={false}
                                         onJoin={() => handleJoinClick(club.dbKey)}
-                                        students={null} // ห้ามผ่านค่าทั้งยวงเพื่อประหยัดโควตา
+                                        students={null}
                                         isStudentSide={true}
                                     />
                                 );
@@ -646,12 +657,10 @@
             const [members, setMembers] = useState([]);
             const [isLoadingMembers, setIsLoadingMembers] = useState(false);
 
-            // 🌟 2. ดึงรายชื่อเด็กแยกเฉพาะชุมนุมนี้เฉพาะเมื่อกดดูรายละเอียด (Lazy-Load Detail เพื่อจำกัด Firestore Reads)
             useEffect(() => {
                 if (isDetailOpen) {
                     setIsLoadingMembers(true);
                     if (isStudentSide) {
-                        // นักเรียนดึงเฉพาะสมาชิกระดับ API ครั้งเดียวเพื่อแสดงผลตอนเปิด
                         const q = query(collection(db, 'students'), where('clubId', '==', club.dbKey));
                         getDocs(q).then((snap) => {
                             setMembers(snap.docs.map(d => d.data()));
@@ -661,7 +670,6 @@
                             setIsLoadingMembers(false);
                         });
                     } else if (students) {
-                        // แอดมินใช้ Cache จาก students ใน state หลัก
                         setMembers(students.filter(s => s.clubId === club.dbKey));
                         setIsLoadingMembers(false);
                     }
@@ -783,33 +791,74 @@
             const [sysSettings, setSysSettings] = useState({ isOpen: false, startTime: '', endTime: '' });
             const [activeTab, setActiveTab] = useState('settings'); 
             const [isLoading, setIsLoading] = useState(true);
+            const [isRefreshing, setIsRefreshing] = useState(false);
 
-            // 🌟 2. ฝั่งผู้ดูแลระบบ (Admin) มีการดึงข้อมูลแบบ Realtime ผ่าน onSnapshot เพื่อให้อัปเดตสถานะแบบเรียลไทม์ได้ถูกต้อง
+            // 🌟 1. ดึงข้อมูลครั้งเดียวผ่าน getDocs (Single Fetch) เพื่อแก้ปัญหาระบบ Data Leak / Read Quota พุ่ง
+            const fetchAdminData = useCallback(async (showNotification = false) => {
+                if (showNotification) {
+                    setIsRefreshing(true);
+                }
+                try {
+                    // ดึงคอลเลกชัน clubs แบบ Single Fetch
+                    const clubsSnap = await getDocs(collection(db, 'clubs'));
+                    const clubsData = clubsSnap.docs.map(doc => ({ dbKey: doc.id, ...doc.data() }));
+                    setClubs(clubsData);
+
+                    // ดึงคอลเลกชัน classes แบบ Single Fetch
+                    const classesSnap = await getDocs(collection(db, 'classes'));
+                    const classesData = classesSnap.docs.map(doc => ({ dbKey: doc.id, ...doc.data() }));
+                    setClasses(classesData);
+
+                    // ดึงคอลเลกชัน students ทั้งหมดแบบ Single Fetch (ไม่ใช้ onSnapshot เพื่อจำกัด Read)
+                    const studentsSnap = await getDocs(collection(db, 'students'));
+                    const studentsData = studentsSnap.docs.map(doc => ({ dbKey: doc.id, ...doc.data() }));
+                    setStudents(studentsData);
+
+                    // ดึงสถิติค่าเปิด-ปิดลงทะเบียน
+                    const settingsSnap = await getDoc(doc(db, 'settings', 'main'));
+                    if (settingsSnap.exists()) {
+                        setSysSettings(settingsSnap.data());
+                    }
+
+                    if (showNotification) {
+                        Swal.fire({
+                            icon: 'success',
+                            title: 'อัปเดตข้อมูลสำเร็จ',
+                            text: 'ระบบได้ทำการดึงข้อมูลล่าสุดเรียบร้อยแล้ว',
+                            confirmButtonColor: '#3b82f6',
+                            timer: 1500,
+                            showConfirmButton: false,
+                            customClass: { popup: 'rounded-2xl' }
+                        });
+                    }
+                } catch (err) {
+                    console.error("Error fetching admin data:", err);
+                    Swal.fire({
+                        icon: 'error',
+                        title: 'ดึงข้อมูลล้มเหลว',
+                        text: 'เกิดข้อผิดพลาดในการโหลดข้อมูลจากเซิร์ฟเวอร์',
+                        confirmButtonColor: '#ef4444',
+                        customClass: { popup: 'rounded-2xl' }
+                    });
+                } finally {
+                    setIsLoading(false);
+                    setIsRefreshing(false);
+                }
+            }, [clubs, classes, students]);
+
+            // 🌟 1. โหลดข้อมูลเมื่อล็อกอินเข้ามาสำเร็จในครั้งแรกครั้งเดียว
             useEffect(() => {
+                fetchAdminData(false);
+                
+                // สำหรับ sysSettings ค่าเปิด-ปิดระบบ แอดมินสามารถเปิด realtime เฝ้าดูได้ (ใช้ทรัพยากรต่ำมาก)
                 const unsubSettings = onSnapshot(doc(db, 'settings', 'main'), (snap) => {
                     if (snap.exists()) setSysSettings(snap.data());
                 });
 
-                const unsubClubs = onSnapshot(collection(db, 'clubs'), (snap) => {
-                    setClubs(snap.docs.map(doc => ({ dbKey: doc.id, ...doc.data() })));
-                });
-
-                const unsubClasses = onSnapshot(collection(db, 'classes'), (snap) => {
-                    setClasses(snap.docs.map(doc => ({ dbKey: doc.id, ...doc.data() })));
-                });
-
-                const unsubStudents = onSnapshot(collection(db, 'students'), (snap) => {
-                    setStudents(snap.docs.map(doc => ({ dbKey: doc.id, ...doc.data() })));
-                    setIsLoading(false);
-                });
-
                 return () => {
                     unsubSettings();
-                    unsubClubs();
-                    unsubClasses();
-                    unsubStudents();
                 };
-            }, []);
+            }, [fetchAdminData]);
 
             if (isLoading) {
                 return <div className="text-center py-10 font-bold text-gray-500">กำลังดึงข้อมูลสำหรับแอดมิน...</div>;
@@ -825,7 +874,19 @@
 
             return (
                 <div className="space-y-4 sm:space-y-6">
-                    <Breadcrumb paths={breadcrumbPath} />
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                        <Breadcrumb paths={breadcrumbPath} />
+                        
+                        {/* 🌟 2. ปุ่มกดโหลดข้อมูลล่าสุด (Refresh Button) สำหรับ Admin บน Dashboard หลัก */}
+                        <button
+                            onClick={() => fetchAdminData(true)}
+                            disabled={isRefreshing}
+                            className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-2 transition shadow-md self-stretch sm:self-auto justify-center"
+                        >
+                            <RefreshCw size={16} className={isRefreshing ? "animate-spin" : ""} />
+                            {isRefreshing ? 'กำลังโหลดข้อมูลล่าสุด...' : 'รีเฟรชข้อมูลล่าสุด'}
+                        </button>
+                    </div>
 
                     <div className="flex space-x-1 sm:space-x-2 border-b border-gray-200 pb-px overflow-x-auto custom-scrollbar">
                         <button
@@ -856,13 +917,13 @@
 
                     <div className="bg-white rounded-b-2xl sm:rounded-b-3xl rounded-tr-2xl sm:rounded-tr-3xl shadow-sm border border-gray-200 p-3 sm:p-6 min-h-[500px] sm:min-h-[600px] w-full overflow-hidden">
                         {activeTab === 'settings' ? (
-                            <AdminSettings sysSettings={sysSettings} clubs={clubs} students={students} />
+                            <AdminSettings sysSettings={sysSettings} clubs={clubs} students={students} onDataRefresh={() => fetchAdminData(false)} />
                         ) : activeTab === 'reports' ? (
                             <AdminReports clubs={clubs} classes={classes} students={students} />
                         ) : activeTab === 'clubs' ? (
-                            <AdminClubs clubs={clubs} students={students} />
+                            <AdminClubs clubs={clubs} students={students} onDataRefresh={() => fetchAdminData(false)} />
                         ) : (
-                            <AdminClasses classes={classes} clubs={clubs} students={students} />
+                            <AdminClasses classes={classes} clubs={clubs} students={students} onDataRefresh={() => fetchAdminData(false)} />
                         )}
                     </div>
                 </div>
@@ -870,7 +931,7 @@
         }
 
         // --- ADMIN: SETTINGS ---
-        function AdminSettings({ sysSettings, clubs, students }) {
+        function AdminSettings({ sysSettings, clubs, students, onDataRefresh }) {
             const [form, setForm] = useState({
                 isOpen: false,
                 startTime: '',
@@ -903,6 +964,7 @@
                         showConfirmButton: false,
                         customClass: { popup: 'rounded-2xl' }
                     });
+                    if (onDataRefresh) onDataRefresh();
                 } catch (err) {
                     Swal.fire({
                         icon: 'error',
@@ -916,11 +978,9 @@
                 }
             };
 
-            // 🌟 3. ระบบซิงค์ข้อมูล (Recalculate & Sync Counts) สำหรับ Admin
             const handleSyncClubCounters = async () => {
                 setIsSyncing(true);
                 try {
-                    // คำนวณจำนวนเด็กในแต่ละชุมนุมจริง ๆ จาก students list ณ ขณะนั้น
                     const actualCounts = {};
                     clubs.forEach(club => {
                         actualCounts[club.dbKey] = 0;
@@ -932,7 +992,6 @@
                         }
                     });
 
-                    // ใช้ writeBatch เพื่อทำการอัปเดต enrolledCount ของทุกชุมนุมพร้อมกัน
                     const batch = writeBatch(db);
                     clubs.forEach(club => {
                         const clubRef = doc(db, 'clubs', club.dbKey);
@@ -950,6 +1009,7 @@
                         confirmButtonColor: '#10b981',
                         customClass: { popup: 'rounded-2xl' }
                     });
+                    if (onDataRefresh) onDataRefresh();
                 } catch (err) {
                     console.error(err);
                     Swal.fire({
@@ -1022,7 +1082,6 @@
                         </form>
                     </div>
 
-                    {/* 🌟 3. ปุ่มซิงค์ยอดนับ ในหน้าตั้งค่าแอดมิน */}
                     <div className="bg-white p-6 sm:p-8 rounded-3xl border border-dashed border-red-300 bg-red-50/20">
                         <div className="flex items-center gap-3 mb-4">
                             <RefreshCw size={24} className="text-red-500" />
@@ -1055,7 +1114,15 @@
             const [selectedReportClass, setSelectedReportClass] = useState(null);
             const [selectedReportStudent, setSelectedReportStudent] = useState(null);
 
-            // 🌟 4. ฝั่งรายงาน Admin: แสดงตัวเลขสถิติสมาชิกโดยอ้างอิงจากฟิลด์ club.enrolledCount เป็นมาตรฐานเดียวกันทั้งหมด
+            const clubMemberMap = useMemo(() => {
+                const map = {};
+                students.forEach(student => {
+                    if (!student.clubId) return;
+                    map[student.clubId] = (map[student.clubId] || 0) + 1;
+                });
+                return map;
+            }, [students]);
+
             const modalStudents = useMemo(() => {
                 if (selectedReportClub) return students.filter(s => s.clubId === selectedReportClub.dbKey);
                 if (selectedReportClass) return students.filter(s => s.classId === selectedReportClass.dbKey);
@@ -1096,7 +1163,7 @@
             const filteredReportClubs = useMemo(() => {
                 return clubs.filter(club => {
                     const matchSearch = club.name.toLowerCase().includes(searchQuery.toLowerCase());
-                    const enrolled = club.enrolledCount || 0; // Source of Truth
+                    const enrolled = clubMemberMap[club.dbKey] || 0; 
                     const isFull = enrolled >= club.capacity;
                     
                     let matchStatus = true;
@@ -1105,7 +1172,7 @@
 
                     return matchSearch && matchStatus;
                 });
-            }, [clubs, searchQuery, statusFilter]);
+            }, [clubs, clubMemberMap, searchQuery, statusFilter]);
 
             const sortedClasses = useMemo(() => {
                 return [...classes].sort((a, b) => a.grade === b.grade ? a.room - b.room : a.grade - b.grade);
@@ -1161,8 +1228,7 @@
                                 </thead>
                                 <tbody className="divide-y divide-gray-100 bg-white">
                                     {filteredReportClubs.map(club => {
-                                        // 🌟 4. หน้าตารางแอดมิน: ใช้ enrolled จาก Firestore ของชุมนุม (enrolledCount) เพื่อให้ตรงกันกับหน้าผู้ใช้อื่น
-                                        const enrolled = club.enrolledCount || 0;
+                                        const enrolled = clubMemberMap[club.dbKey] || 0;
                                         const isFull = enrolled >= club.capacity;
                                         return (
                                             <tr key={club.dbKey} className="hover:bg-gray-50 transition">
@@ -1351,13 +1417,22 @@
         }
 
         // --- ADMIN: CLUBS ---
-        function AdminClubs({ clubs, students }) {
+        function AdminClubs({ clubs, students, onDataRefresh }) {
             const [viewFilter, setViewFilter] = useState('all'); 
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [editingClub, setEditingClub] = useState(null);
             const [formData, setFormData] = useState({ name: '', teacher: '', capacity: 20, category: 'm_ton' });
             const [isImportingClubs, setIsImportingClubs] = useState(false);
             const clubFileInputRef = useRef(null);
+
+            const clubMemberMap = useMemo(() => {
+                const map = {};
+                students.forEach(student => {
+                    if (!student.clubId) return;
+                    map[student.clubId] = (map[student.clubId] || 0) + 1;
+                });
+                return map;
+            }, [students]);
 
             const filteredClubs = useMemo(() => {
                 if (viewFilter === 'all') return clubs;
@@ -1378,7 +1453,6 @@
             const handleSave = async (e) => {
                 e.preventDefault();
                 try {
-                    // 🌟 บันทึก/อัปเดตข้อมูลโครงสร้างใหม่พร้อมค่าตั้งต้น enrolledCount: 0
                     if (editingClub) {
                         await updateDoc(doc(db, 'clubs', editingClub.dbKey), formData);
                     } else {
@@ -1395,6 +1469,7 @@
                         confirmButtonColor: '#3b82f6',
                         customClass: { popup: 'rounded-2xl' }
                     });
+                    if (onDataRefresh) onDataRefresh();
                 } catch (err) {
                     console.error(err);
                 }
@@ -1436,6 +1511,7 @@
                         confirmButtonColor: '#3b82f6',
                         customClass: { popup: 'rounded-2xl' }
                     });
+                    if (onDataRefresh) onDataRefresh();
                 }
             };
 
@@ -1489,6 +1565,7 @@
                         confirmButtonColor: '#10b981',
                         customClass: { popup: 'rounded-2xl' }
                     });
+                    if (onDataRefresh) onDataRefresh();
                 } catch (error) {
                     Swal.fire({
                         icon: 'error',
@@ -1630,7 +1707,7 @@
         }
 
         // --- ADMIN: CLASSES & STUDENTS ---
-        function AdminClasses({ classes, clubs, students }) {
+        function AdminClasses({ classes, clubs, students, onDataRefresh }) {
             const [selectedClassId, setSelectedClassId] = useState(null);
             const [isImporting, setIsImporting] = useState(false);
             const fileInputRef = useRef(null);
@@ -1690,6 +1767,7 @@
                         confirmButtonColor: '#10b981',
                         customClass: { popup: 'rounded-2xl' }
                     });
+                    if (onDataRefresh) onDataRefresh();
                 } catch (error) {
                     Swal.fire({
                         icon: 'error',
@@ -1755,6 +1833,11 @@
                                             <h4 className="text-xl sm:text-2xl font-black text-gray-800 group-hover:text-blue-600 transition tracking-tight">ม.{cls.grade}/{cls.room}</h4>
                                             <ChevronRight className="text-gray-300 group-hover:text-blue-500 transition w-4 h-4 sm:w-5 sm:h-5" />
                                         </div>
+                                        <div className="bg-blue-50 inline-flex px-2 sm:px-3 py-1 sm:py-1.5 rounded-lg border border-blue-100">
+                                            <p className="text-[10px] sm:text-sm text-blue-800 font-bold flex items-center gap-1 sm:gap-2">
+                                                <Users size={12} className="sm:w-3.5 sm:h-3.5"/> นักเรียน {classStudents.length} คน
+                                            </p>
+                                        </div>
                                     </div>
                                 );
                             })}
@@ -1776,11 +1859,12 @@
                     onBack={() => setSelectedClassId(null)}
                     students={students}
                     clubs={clubs}
+                    onDataRefresh={onDataRefresh}
                 />
             );
         }
 
-        function ClassStudentManager({ classData, onBack, students, clubs }) {
+        function ClassStudentManager({ classData, onBack, students, clubs, onDataRefresh }) {
             const classStudents = useMemo(() => {
                 return students.filter(s => s.classId === classData?.dbKey);
             }, [students, classData]);
@@ -1863,6 +1947,7 @@
                             confirmButtonColor: '#3b82f6',
                             customClass: { popup: 'rounded-2xl' }
                         });
+                        if (onDataRefresh) onDataRefresh();
                     } catch (error) {
                         console.error("Error deleting student:", error);
                         Swal.fire({
@@ -1944,6 +2029,7 @@
                             confirmButtonColor: '#3b82f6',
                             customClass: { popup: 'rounded-2xl' }
                         });
+                        if (onDataRefresh) onDataRefresh();
                     } catch (err) {
                         console.error(err);
                         Swal.fire({
